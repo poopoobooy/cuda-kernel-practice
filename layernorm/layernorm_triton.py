@@ -123,31 +123,34 @@ def _correctness_test():
     print(f"[OK] layernorm_triton vs torch  max_diff={diff:.3e}")
 
 
-def _bench(M: int, N: int, n_iter: int = 100, n_warmup: int = 20):
+def _bench(M: int, N: int, n_repeat: int = 20, n_warmup: int = 10):
+    """L2 flush + median, 同 softmax_triton._bench 的稳定 benchmark 思路"""
     x = torch.randn(M, N, device='cuda', dtype=torch.float32)
     w = torch.randn(N, device='cuda', dtype=torch.float32)
     b = torch.randn(N, device='cuda', dtype=torch.float32)
 
-    for _ in range(n_warmup):
-        layernorm_triton(x, w, b)
-        torch.nn.functional.layer_norm(x, (N,), weight=w, bias=b)
-    torch.cuda.synchronize()
+    flush = torch.empty(64 * 1024 * 1024 // 4, device='cuda', dtype=torch.float32)
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(n_iter):
-        layernorm_triton(x, w, b)
-    end.record()
-    torch.cuda.synchronize()
-    triton_ms = start.elapsed_time(end) / n_iter
+    def time_one(fn):
+        ts = []
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        for _ in range(n_warmup):
+            fn()
+        torch.cuda.synchronize()
+        for _ in range(n_repeat):
+            flush.zero_()
+            torch.cuda.synchronize()
+            s.record()
+            fn()
+            e.record()
+            torch.cuda.synchronize()
+            ts.append(s.elapsed_time(e))
+        ts.sort()
+        return ts[len(ts) // 2]
 
-    start.record()
-    for _ in range(n_iter):
-        torch.nn.functional.layer_norm(x, (N,), weight=w, bias=b)
-    end.record()
-    torch.cuda.synchronize()
-    torch_ms = start.elapsed_time(end) / n_iter
+    triton_ms = time_one(lambda: layernorm_triton(x, w, b))
+    torch_ms  = time_one(lambda: torch.nn.functional.layer_norm(x, (N,), weight=w, bias=b))
 
     bytes_per_iter = M * N * 4 * 2
     return {

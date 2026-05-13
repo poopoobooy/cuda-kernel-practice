@@ -1,8 +1,13 @@
-"""读 results.json 画性能曲线图"""
+"""读 results.json 画性能曲线图
+
+注: 必须 `import torch` 先初始化 MKL, 否则 numpy/matplotlib import 会 DLL 冲突
+    (Windows + conda-forge pytorch + numpy 的已知坑)
+"""
 
 import json
 from pathlib import Path
 
+import torch  # noqa: F401 ; 必须先 import 它初始化 MKL
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parent.parent

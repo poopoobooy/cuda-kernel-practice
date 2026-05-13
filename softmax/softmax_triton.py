@@ -73,8 +73,15 @@ def softmax_triton(x: torch.Tensor) -> torch.Tensor:
     if BLOCK_SIZE >= 4096:
         num_warps = 16
 
-    # num_stages: 软件流水线深度，A100/Ada 上 4 是个稳的值
-    num_stages = 4 if x.device.type == 'cuda' else 2
+    # num_stages: 软件流水线深度，每多 1 个 stage 多吃一份 SMEM
+    # Ada (sm_89) 每 block SMEM 上限 ~99KB; BLOCK_SIZE * 4 bytes * num_stages 不能超
+    # BLOCK_SIZE=16384 (64KB/iter) 时只能 stages=1
+    if BLOCK_SIZE * 4 <= 16 * 1024:        # <= 16KB/iter, 可以 4 stages
+        num_stages = 4
+    elif BLOCK_SIZE * 4 <= 32 * 1024:      # <= 32KB/iter, 2 stages
+        num_stages = 2
+    else:                                   # 大 block, 不流水
+        num_stages = 1
 
     y = torch.empty_like(x)
 
@@ -108,45 +115,48 @@ def _correctness_test():
           f"{(y_triton - y_torch).abs().max().item():.3e}")
 
 
-def _bench(M: int, N: int, n_iter: int = 100, n_warmup: int = 20):
-    """返回 dict: {'triton_ms', 'torch_ms', 'speedup'}"""
+def _bench(M: int, N: int, n_repeat: int = 20, n_warmup: int = 10):
+    """稳定的 benchmark:
+       - 每次测量前 L2 cache flush, 避免 hot-cache 测出虚假高带宽
+       - 取 median 而非 mean, 抗 GPU clock 抖动
+       - 单次跑一个 kernel iter (不内部循环), 因为大 N 时一次就足够准
+    """
     x = torch.randn(M, N, device='cuda', dtype=torch.float32)
 
-    # warmup
-    for _ in range(n_warmup):
-        softmax_triton(x)
-        torch.softmax(x, dim=-1)
-    torch.cuda.synchronize()
+    # 64MB 的 dummy tensor 用来 flush L2 (4090 Laptop L2 = ~64MB)
+    flush_size = 64 * 1024 * 1024 // 4
+    flush = torch.empty(flush_size, device='cuda', dtype=torch.float32)
 
-    # Triton
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(n_iter):
-        softmax_triton(x)
-    end.record()
-    torch.cuda.synchronize()
-    triton_ms = start.elapsed_time(end) / n_iter
+    def time_one(fn):
+        ts = []
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        # warmup
+        for _ in range(n_warmup):
+            fn()
+        torch.cuda.synchronize()
+        for _ in range(n_repeat):
+            flush.zero_()           # 写 64MB 把 L2 冲掉
+            torch.cuda.synchronize()
+            s.record()
+            fn()
+            e.record()
+            torch.cuda.synchronize()
+            ts.append(s.elapsed_time(e))
+        ts.sort()
+        return ts[len(ts) // 2]      # median
 
-    # PyTorch eager
-    start.record()
-    for _ in range(n_iter):
-        torch.softmax(x, dim=-1)
-    end.record()
-    torch.cuda.synchronize()
-    torch_ms = start.elapsed_time(end) / n_iter
+    triton_ms = time_one(lambda: softmax_triton(x))
+    torch_ms  = time_one(lambda: torch.softmax(x, dim=-1))
 
-    # 带宽: softmax 是 memory bound（每个 elem 读 1 次 + 写 1 次）
-    bytes_per_iter = M * N * 4 * 2  # fp32 read + write
-    gb_s_triton = bytes_per_iter / (triton_ms * 1e-3) / 1e9
-    gb_s_torch = bytes_per_iter / (torch_ms * 1e-3) / 1e9
+    bytes_per_iter = M * N * 4 * 2   # fp32 read + write
     return {
         'M': M, 'N': N,
         'triton_ms': triton_ms,
         'torch_ms': torch_ms,
         'speedup': torch_ms / triton_ms,
-        'triton_gbs': gb_s_triton,
-        'torch_gbs': gb_s_torch,
+        'triton_gbs': bytes_per_iter / (triton_ms * 1e-3) / 1e9,
+        'torch_gbs':  bytes_per_iter / (torch_ms  * 1e-3) / 1e9,
     }
 
 
