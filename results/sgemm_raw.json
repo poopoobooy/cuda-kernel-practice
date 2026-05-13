@@ -1,0 +1,8 @@
+[
+  {"version":"cuBLAS","gflops":24516.09,"ms":5.6061,"pct_cublas":100.0,"max_err":0.0},
+  {"version":"01_naive","gflops":333.79,"ms":411.7568,"pct_cublas":1.36,"max_err":0.000e+00},
+  {"version":"02_coalesce","gflops":2392.48,"ms":57.4463,"pct_cublas":9.76,"max_err":0.000e+00},
+  {"version":"03_smem","gflops":3279.90,"ms":41.9034,"pct_cublas":13.38,"max_err":0.000e+00},
+  {"version":"04_1d_tile","gflops":10187.15,"ms":13.4914,"pct_cublas":41.55,"max_err":0.000e+00},
+  {"version":"05_2d_tile","gflops":19511.30,"ms":7.0441,"pct_cublas":79.59,"max_err":0.000e+00}
+]

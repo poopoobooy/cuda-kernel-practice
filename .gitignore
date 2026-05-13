@@ -18,6 +18,7 @@ dist/
 *.o
 *.so
 *.dll
+*.pyd
 
 # PyTorch extension 构建缓存
 torch_ext/build/

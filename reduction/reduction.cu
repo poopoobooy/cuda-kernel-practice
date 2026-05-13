@@ -118,22 +118,16 @@ __global__ void reduce_v3_grid_stride(const float* in, float* out, int N) {
     }
 }
 
-// host: 跑两阶段 reduction (kernel 输出 per-block partial, 再 host 累加; 或再调一次 kernel)
-template <typename K>
-float run_reduce(K kernel, const float* dIn, int N, int block_size, int smem_bytes) {
-    int n_blocks = (N + block_size - 1) / block_size;
-    float *dPartial;
-    CHECK_CUDA(cudaMalloc(&dPartial, sizeof(float) * n_blocks));
-    kernel<<<n_blocks, block_size, smem_bytes>>>(dIn, dPartial, N);
-    CHECK_LAST_CUDA_ERROR();
+// 注意: 之前版本的 run_reduce 每次跑都 cudaMalloc + cudaMemcpy, 这两步加起来
+//       ~1-2ms 完全主导了 kernel 本身时间 (kernel ~0.1-0.3ms),
+//       导致 "warp shuffle 比 SMEM tree 慢" 的反直觉数据.
+//       正确做法: dPartial 在 bench 外预分配; 计时器只圈住 kernel launch.
 
-    // host 累加 partial (n_blocks 一般几千, 拉回来 CPU 加一下就行; 真要全 GPU 就再调一次)
-    std::vector<float> hPart(n_blocks);
-    CHECK_CUDA(cudaMemcpy(hPart.data(), dPartial, sizeof(float)*n_blocks, cudaMemcpyDeviceToHost));
-    double s = 0.0;
-    for (float x : hPart) s += x;
-    CHECK_CUDA(cudaFree(dPartial));
-    return (float)s;
+template <typename K>
+void launch_reduce(K kernel, const float* dIn, float* dPartial,
+                   int N, int block_size, int smem_bytes) {
+    int n_blocks = (N + block_size - 1) / block_size;
+    kernel<<<n_blocks, block_size, smem_bytes>>>(dIn, dPartial, N);
 }
 
 int main(int argc, char** argv) {
@@ -151,35 +145,50 @@ int main(int argc, char** argv) {
 
     constexpr int BS = 256;
     int smem = BS * sizeof(float);
+    int n_blocks = (N + BS - 1) / BS;
 
-    auto bench = [&](const char* name, auto kernel, int items_per_thread = 1) {
+    // 提前分配 dPartial 和 host buf, 不计入 bench 时间
+    float* dPartial;
+    CHECK_CUDA(cudaMalloc(&dPartial, sizeof(float) * n_blocks));
+    std::vector<float> hPart(n_blocks);
+
+    // 给最后一轮校验用 (取一次 sum)
+    auto sum_partial = [&](void) -> float {
+        CHECK_CUDA(cudaMemcpy(hPart.data(), dPartial, sizeof(float)*n_blocks, cudaMemcpyDeviceToHost));
+        double s = 0.0;
+        for (float x : hPart) s += x;
+        return (float)s;
+    };
+
+    auto bench = [&](const char* name, auto kernel) {
         // warmup
-        for (int i = 0; i < 3; ++i) {
-            if (items_per_thread == 1)
-                run_reduce(kernel, d, N, BS, smem);
-            else
-                run_reduce(kernel, d, N, BS, 0);
+        for (int i = 0; i < 5; ++i) {
+            launch_reduce(kernel, d, dPartial, N, BS, smem);
         }
         CHECK_CUDA(cudaDeviceSynchronize());
+
+        // 校验 (跑一次, 取 partial sum 跟 cpu 对比)
+        launch_reduce(kernel, d, dPartial, N, BS, smem);
+        float gpu_sum = sum_partial();
+
+        // 真正的 bench: 只圈 kernel
         CudaTimer t;
-        const int n_iter = 50;
+        const int n_iter = 200;       // reduction 太短, 多跑些
         t.start();
-        float gpu_sum = 0.f;
         for (int i = 0; i < n_iter; ++i) {
-            gpu_sum = run_reduce(kernel, d, N, BS, smem);
+            launch_reduce(kernel, d, dPartial, N, BS, smem);
         }
         float ms = t.stop() / n_iter;
         double gbs = (double)N * 4 / (ms * 1e-3) / 1e9;
-        printf("[%s] %.4f ms, %.1f GB/s,  sum_diff = %.3e\n",
+        printf("[%s] %.4f ms, %6.1f GB/s,  sum_diff = %.3e\n",
                name, ms, gbs, std::fabs(gpu_sum - (float)cpu_sum));
     };
 
-    bench("v0_smem_tree         ", reduce_v0_smem_tree);
-    bench("v1_unroll_last_warp  ", reduce_v1_unroll_last_warp);
-    bench("v2_shfl_pure_warp    ", reduce_v2_shfl);
-    // v3 是 grid stride, 接口稍不同, 这里跑下默认 ELEMS_PER_THREAD=8
-    // (为了简化, 这版用 N/8 大小的 grid; 严格性能调优时 ELEMS_PER_THREAD 要 grid search)
-    // bench("v3_grid_stride_8     ", reduce_v3_grid_stride<8>, 8);  // 接口不一致, 留作 TODO
+    bench("v0_smem_tree        ", reduce_v0_smem_tree);
+    bench("v1_unroll_last_warp ", reduce_v1_unroll_last_warp);
+    bench("v2_shfl_pure_warp   ", reduce_v2_shfl);
+
+    CHECK_CUDA(cudaFree(dPartial));
 
     CHECK_CUDA(cudaFree(d));
     return 0;
