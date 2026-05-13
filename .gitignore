@@ -1,0 +1,42 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+
+# CUDA / C++ 编译产物
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.o
+*.so
+*.dll
+
+# PyTorch extension 构建缓存
+torch_ext/build/
+torch_ext/*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统
+Thumbs.db
+.DS_Store
+
+# 大文件 / 临时
+*.log
+*.tmp
+*.cache
+
+# 但要保留 results 目录下的 json/png（这些是面试要看的产物）
+!results/*.json
+!results/*.png

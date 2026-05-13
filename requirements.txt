@@ -1,0 +1,18 @@
+# 项目依赖（与 conda env 'cuda-kernel' 对应）
+# 安装方式：
+#   conda create -n cuda-kernel -c conda-forge python=3.11 -y
+#   conda run -n cuda-kernel pip install torch --index-url https://download.pytorch.org/whl/cu126
+#   conda run -n cuda-kernel pip install -r requirements.txt
+#
+# 注：torch 单独装（要走 PyTorch 自家 index-url 拉 CUDA wheel）
+
+# Triton (Windows 用 triton-windows，Linux/WSL 直接 triton)
+triton-windows>=3.5.0 ; platform_system == "Windows"
+triton>=3.5.0 ; platform_system != "Windows"
+
+# 数值 & 画图
+numpy>=2.0
+matplotlib>=3.9
+
+# benchmark / 表格输出
+tabulate>=0.9
