@@ -86,6 +86,46 @@ def plot_sgemm(data):
     print(f"[OK] -> {out}")
 
 
+def plot_flash_attention(fa_block):
+    """画 FA1 vs naive 3-pass 的 speedup 曲线 (按 N 维)"""
+    if not fa_block or not fa_block.get('runs'):
+        return
+    runs = fa_block['runs']
+    # 用 (B*H, N) 联合作横轴标签
+    labels = [f"BH={r['B']*r['H']}\nN={r['N']}" for r in runs]
+    fa_ms = [r['fa1_ms'] for r in runs]
+    naive_ms = [r['naive_ms'] for r in runs]
+    speedup = [r['speedup'] for r in runs]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    x = list(range(len(runs)))
+    width = 0.38
+    ax1.bar([i - width/2 for i in x], fa_ms, width, label='FA1 (ours)', color='steelblue')
+    ax1.bar([i + width/2 for i in x], naive_ms, width, label='Naive 3-pass', color='coral')
+    ax1.set_yscale('log')
+    ax1.set_ylabel('Time (ms, log)')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, fontsize=8)
+    ax1.set_title('Flash Attention 1 vs Naive 3-pass  (FP32, d=64, RTX 4090 Laptop)')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    ax2.plot(x, speedup, marker='o', linewidth=2, color='green')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels, fontsize=8)
+    ax2.set_ylabel('Speedup (×)')
+    ax2.set_title('FA1 speedup vs naive')
+    ax2.axhline(1.0, ls='--', c='gray', alpha=0.5)
+    for i, v in enumerate(speedup):
+        ax2.text(i, v, f'{v:.1f}×', ha='center', va='bottom', fontsize=9)
+    ax2.grid(True, alpha=0.3)
+
+    out = ROOT / 'results' / 'flash_attention_curve.png'
+    fig.savefig(out, dpi=130, bbox_inches='tight')
+    print(f"[OK] -> {out}")
+
+
 def main():
     json_path = ROOT / 'results' / 'results.json'
     if not json_path.exists():
@@ -97,6 +137,7 @@ def main():
     plot_softmax(data.get('softmax'))
     plot_layernorm(data.get('layernorm'))
     plot_sgemm(data.get('sgemm'))
+    plot_flash_attention(data.get('flash_attention_1_fwd'))
 
 
 if __name__ == '__main__':

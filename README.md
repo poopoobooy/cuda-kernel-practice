@@ -4,13 +4,15 @@
 
 ## TL;DR
 
-- **手写 SGEMM 5 版**：在 RTX 4090 Laptop（sm_89, FP32）上从 333 GFLOPS（naive）一路优化到 **19,511 GFLOPS = cuBLAS 的 79.6%**
+- **手写 SGEMM 6 版**：FP32 从 333 GFLOPS（naive）→ **19,511 GFLOPS（v5 2D tile）= cuBLAS 79.6%**；进一步 FP16 + **TensorCore (WMMA) v6 在 8192×8192 跑到 60.5 TFLOPS = cuBLAS TC 78.3%**，比 FP32 v5 提速 3.1×
+- **Flash Attention 1 forward 手写实现**：FP32 + online softmax + block-tiled，B=1 H=8 N=4096 比朴素 3-pass attention **快 8.4×**；N=8192 时 **10.1×** + 节省 1 GB HBM 写
 - **PyTorch C++/CUDA Extension** 把手写 SGEMM v5 接入 `torch.autograd.Function`，forward / backward `torch.allclose` 全部 max_err = 0.000e+00（位级精确）
 - **Softmax CUDA** 手写 (warp-shuffle reduction + safe softmax + `__expf`)：M=4096 N=512 跑到 514 GB/s（≈ HBM 理论带宽 89%）
 - **Reduction 三版对比**：SMEM tree → unroll last warp → 纯 warp shuffle，带宽 290 → 515 → **660 GB/s**（2.3× 提升）
 - **Triton softmax / layernorm**：在小 size 上输给 PyTorch 2.10 eager（PyTorch 自带 fused 已经够强）——**老实记录**在踩坑笔记里，没硬塞数据
 
 ![sgemm](results/sgemm_curve.png)
+![flash_attention](results/flash_attention_curve.png)
 ![softmax](results/softmax_curve.png)
 ![layernorm](results/layernorm_curve.png)
 
@@ -40,6 +42,7 @@ cuda-kernel-practice/
 │   ├── 03_smem.cu          #   v3 BS=32 shared memory tiling
 │   ├── 04_1d_tile.cu       #   v4 每 thread TM=8 个 C 元素 + register tile
 │   ├── 05_2d_tile.cu       #   v5 TM=TN=8 2D thread tile + 外积累加
+│   ├── 06_wmma_fp16.cu     #   v6 FP16 + Ada 4th-gen TensorCore (wmma::fragment)
 │   ├── bench.cu            #   5 版 + cuBLAS 一起跑，写 sgemm_raw.json
 │   └── sgemm_triton.py     #   Triton matmul 版（autotune）
 ├── softmax/
@@ -49,6 +52,8 @@ cuda-kernel-practice/
 │   └── layernorm_triton.py # Triton fused，fp32 累加保精度
 ├── reduction/
 │   └── reduction.cu        # SMEM tree v.s. warp shuffle 三版对比
+├── flash_attn/
+│   └── fa1_fwd.cu          # FlashAttention-1 forward (FP32, d=64) + naive 对照
 ├── torch_ext/
 │   ├── sgemm_op.cu         # v5 包装成 torch.autograd.Function
 │   ├── setup.py            # CUDAExtension（含 conda-forge lib 路径 fix）
@@ -103,6 +108,21 @@ python bench\plot.py
 
 > **核心结论**：从 naive 到 v5 整体 **58× 提速**；其中"改 thread mapping 触发 coalesce"单步就拿到 7.2×，是最划算的优化。
 
+### SGEMM v6：FP16 + TensorCore (WMMA)
+
+换 dtype 到 FP16 in / FP32 accumulate, 用 Ada 4th-gen TensorCore (`mma.sync` 16×16×16) 跑同样的矩阵乘。
+
+| Size | Ours WMMA (TFLOPS) | cuBLAS GemmEx TC (TFLOPS) | % cuBLAS | max_err |
+|---:|---:|---:|---:|---:|
+| 2048 | 43.37 | 55.48 | 78.2% | 0.000e+00 |
+| 4096 | 51.50 | 66.12 | 77.9% | 0.000e+00 |
+| 8192 | 60.48 | 77.25 | 78.3% | 1.198e-03 |
+
+**配置**：`BM×BN = 128×128`，`BK = 32`，每 warp `WM×WN = 64×64`（4×4 = 16 个 mma fragment）、4 warps/block = 128 threads/block。  
+**vs FP32 v5（19.5 TFLOPS @4096）**：FP16 v6 在 4096 上 51.5 TFLOPS，提速 **2.6×**；在 8192 上 60.5 TFLOPS，提速 **3.1×**。  
+**vs cuBLAS FP32（24.5 TFLOPS）**：v6 (8192) 是它的 **2.5×**。  
+**为什么 cuBLAS TC 没到理论 165 TFLOPS**：4090 **Laptop** 的 TGP 限制（持续负载下 boost clock 严重下调），cuBLAS 自己也只能跑到 ~77 TFLOPS。Desktop 4090 / 5090 / H100 上同代码会接近峰值。
+
 ### Softmax CUDA（warp-shuffle reduction）
 
 | Workload | ms | GB/s | max_diff vs CPU ref |
@@ -121,6 +141,20 @@ python bench\plot.py
 
 > v2 没有 SMEM 也没 bank conflict，warp 内 `__shfl_down_sync` 5 步搞定 32 个值的 sum。  
 > 看到 660 GB/s > HBM 576 GB/s 的理论上限是因为 64 MB 数据部分命中 L2（4090 Laptop L2 = 32 MB），属正常现象。
+
+### Flash Attention 1 forward（FP32, head_dim=64）
+
+| Config | FA1 ms | Naive 3-pass ms | Speedup | max_err vs naive |
+|---|---:|---:|---:|---:|
+| B=1 H=1 N=64    |  0.057 |  0.063  |  1.12× | 1.19e-07 |
+| B=1 H=1 N=512   |  0.385 |  0.233  |  0.60× | 1.19e-07 |
+| B=1 H=1 N=4096  |  2.121 |  7.648  |  3.61× | 2.07e-07 |
+| B=1 H=8 N=2048  |  2.415 | 15.226  |  6.30× | 2.22e-07 |
+| **B=1 H=8 N=4096**  | **7.195** | **60.514** | **8.41×** | 2.07e-07 |
+| **B=1 H=4 N=8192**  | **12.39** | **125.6**  | **10.14×** | 3.13e-07 |
+
+> **scaling 趋势完全符合 FA paper**：小 N (≤512) FA1 launch overhead 反而吃亏；从 N=2048 开始就稳定 5×+；N=8192 时 **10× + 节省 1 GB HBM 写**（朴素版要把 BH·N² = 32M·4B 的 P 矩阵写回 HBM 再读回）。  
+> **max_err = 1e-7 量级是 FP32 reduction 顺序差异的极限**，相对误差 ~1e-7，证明算法实现正确。
 
 ### PyTorch C++ Extension（M=N=K=4096）
 
@@ -176,7 +210,30 @@ LayerNorm  N=8192   Triton 1.06ms   Torch 1.03ms   speedup 0.96×
 - 每 thread 算 TM×TN = 8×8 = 64 个 C 元素
 - inner loop 外积：`acc[i][j] += reg_a[i] * reg_b[j]`，64 FMA 只要 16 个 SMEM load → 算力密度 4 FMA/load
 - **4090 Laptop 上 1.9× 提速，达到 cuBLAS 79.6%**
-- 再想往上需要 ldmatrix + TensorCore + double buffer + async copy，本项目时间不够
+- 再想往上需要 ldmatrix + TensorCore + double buffer + async copy，FP32 SIMT 路线到这就到瓶颈了
+
+### v5 → v6：FP16 + TensorCore (WMMA)
+- 换路线：**SIMT FP32 (FMA) → TensorCore FP16-in/FP32-acc (mma.sync 16×16×16)**
+- 用 `nvcuda::wmma::fragment` 三件套：`load_matrix_sync` → `mma_sync` → `store_matrix_sync`，一次 mma.sync 算 16×16×16 = 4096 FMA
+- **warp tile** WM×WN = 64×64：每 warp 持有 4×4 = 16 个 accumulator fragment（FP32），跨 K 维做 (BK/16) 次 mma 累加
+- **block tile** BM×BN = 128×128, BK=32：4 warps/block 排成 2×2 拼成 128×128
+- SMEM 用 `int4` (128-bit) 向量加载 + `+8` half padding 防 bank conflict
+- **算力密度**：每 warp 单 K-step 做 65536 FMA、SMEM load 仅 (16+16)×16×16 个 half = 数 KB，**arithmetic intensity 比 v5 高一个数量级**
+- 数值正确性：4096 时与 cuBLAS bit-exact，8192 时 max_err 1.2e-3（FP16 累加 K=8192 次的合理误差）
+- 进一步想拿剩下的 22% 需要：**ldmatrix.sync + cp.async pipeline + double-buffer + swizzled SMEM layout**（这是 CUTLASS GEMM 主线），本项目时间到这就停
+
+### Flash Attention 1 forward
+- **核心痛点**：朴素 attention 把 `P = softmax(Q @ K^T / sqrt(d))` 显式写回 HBM，N=4096 时 P 矩阵就 64 MB / head，N=8192 直接 256 MB / head。HBM 带宽全砸在这
+- **FA1 idea**：把 Q 分成 `Br` 行块、K/V 分成 `Bc` 行块，**外层遍历 Q 块、内层遍历 K/V 块**，在 register / SMEM 里跑「block 内 softmax + online rescale」，从头到尾都不 materialize N×N 的 P 矩阵
+- **online softmax 数学**：维护 `(m_i, l_i, O_i)` running 状态。看到新 chunk 的 `m_local`、`l_local` 时
+  - `m_new = max(m_i, m_local)`
+  - `α = exp(m_i - m_new)`, `β = exp(m_local - m_new)`
+  - `l_new = α·l_i + β·l_local`
+  - `O_new = α·O_i + β·(P_local @ V_local)` ← **OLD 必须乘 α 重新对齐到新 max**
+  - 最后 `O / l_i` 一次性归一化
+- **本实现**：FP32，Br=Bc=64，每 thread 一行 Q（共 64 threads/block），head_dim=64 全在寄存器。SMEM 仅缓存当前 K/V 块（32 KB）
+- **效果**：N=4096 H=8 比朴素 3-pass 快 **8.4×**，N=8192 H=4 快 **10.1×**，省 1 GB P 矩阵写回。Max diff 1e-7 量级 = FP32 极限
+- 工业 FA2/FA3 在此基础上 + 多 warp 协同 + TensorCore (mma.sync) + cp.async + warp specialization，本项目止步在算法层教学版
 
 ### Softmax CUDA
 - safe softmax：减 max 防 `expf` 溢出（FP32 `expf(>89)` 就 inf）
@@ -206,6 +263,7 @@ LayerNorm  N=8192   Triton 1.06ms   Torch 1.03ms   speedup 0.96×
 7. **reduction.cu 的 benchmark 一开始数字反序**（warp shuffle 反而比 SMEM tree 慢） —— 因为 `cudaMalloc` + `cudaMemcpy` 每 iter 都跑，1-2ms 主导了 0.1ms 的 kernel。修成 "预分配 + 只圈 kernel" 才看到真实 2.3×。
 8. **Triton autotune 首跑 5-15 分钟**（200+ configs × Windows JIT 编译慢）—— 裁剪到 8 个 Ada 经验配置才能 30 秒内完成。
 9. **bench 数字抖动大** — 4090 Laptop GPU clock 动态 boost + L2 cache 命中导致同 kernel 跑两次差 10%+。修法：每次测量前 `flush.zero_()` 写 64MB 把 L2 冲掉、`torch.cuda.synchronize()` 后取 20 次的 median 而非 mean。
+10. **FA1 对照用的 naive softmax 一开始算错** — 写了个 128 threads/block 的 softmax，但 `__shfl_xor_sync` warp-shuffle 只在单 warp (32 lane) 内做 reduce，warp 1/2/3 的 max/sum 全部被丢掉。导致 FA1 vs naive 差 0.16 的"假 bug"。修法：加 SMEM `warp_buf[8]` 做两层 reduce（warp 内 shuffle → SMEM → 0 号 warp 再 shuffle），改完 max_err 立刻从 1.7e-1 掉到 **1.2e-7**（FP32 reduction 顺序的极限）。**这告诉我：写 reference kernel 的 bug 比写要测的 kernel 的 bug 更难发现，因为你下意识相信 reference。**
 
 ## 我学到了什么
 

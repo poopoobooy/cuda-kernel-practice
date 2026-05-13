@@ -1,62 +1,71 @@
-# build_and_run.ps1 —— 一键编译 + 跑全部 CUDA C++ kernels
-# ========================================================
-# 用法: powershell -ExecutionPolicy Bypass -File .\build_and_run.ps1
+﻿# build_and_run.ps1 -- one-shot: compile + run all CUDA C++ kernels
+# ================================================================
+# Usage:  powershell -ExecutionPolicy Bypass -File .\build_and_run.ps1
 #
-# 这个脚本做了 3 件事:
-#   1. source vcvarsall.bat x64 (配置 MSVC 环境)
-#   2. 把 nvcc 加进 PATH
-#   3. 用一个 cmd 调用串起来编 + 跑 所有 kernel
+# Steps:
+#   1. source vcvarsall.bat x64 (MSVC env)
+#   2. put nvcc on PATH via $env:PATH
+#   3. invoke nvcc through cmd /c so the MSVC env survives
 
 $ErrorActionPreference = "Stop"
 
-# ---- 路径 ----
-$VCVARS = "E:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
+$VCVARS   = "E:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
 $CUDA_BIN = "C:\Users\16229\miniconda3\envs\cuda-kernel\Library\bin"
-$NVCC = "$CUDA_BIN\nvcc.exe"
+$NVCC     = Join-Path $CUDA_BIN "nvcc.exe"
 
 if (-not (Test-Path $VCVARS)) { throw "vcvarsall.bat not found at $VCVARS" }
 if (-not (Test-Path $NVCC))   { throw "nvcc not found at $NVCC" }
 
-# ---- 编译命令 ----
-# 关键 flags:
-#   -O3              host 端最大优化
-#   -arch=sm_89      Ada (4090) GPU 编译目标
-#   --use_fast_math  __expf / fdividef 走 fast intrinsic (softmax 必备)
+# flags:
+#   -O3              host opt
+#   -arch=sm_89      Ada (4090)
+#   --use_fast_math  __expf / fdividef / __fsqrt etc.
 $NVCC_FLAGS = "-O3 -arch=sm_89 --use_fast_math"
 
-# 列表: 文件 -> 输出 exe
-$builds = @(
-    @{src='sgemm\01_naive.cu';    out='sgemm\01_naive.exe'},
-    @{src='sgemm\02_coalesce.cu'; out='sgemm\02_coalesce.exe'},
-    @{src='sgemm\03_smem.cu';     out='sgemm\03_smem.exe'},
-    @{src='sgemm\04_1d_tile.cu';  out='sgemm\04_1d_tile.exe'},
-    @{src='sgemm\05_2d_tile.cu';  out='sgemm\05_2d_tile.exe'},
-    @{src='sgemm\bench.cu';       out='sgemm\sgemm_bench.exe';   extra='-DLIB_ONLY -lcublas'},
-    @{src='softmax\softmax_cuda.cu'; out='softmax\softmax_cuda.exe'},
-    @{src='reduction\reduction.cu';  out='reduction\reduction.exe'}
-)
+function Invoke-NvccBuild {
+    param(
+        [string]$Src,
+        [string]$Out,
+        [string]$Extra = ""
+    )
+    $q = [char]34
+    $cmd = "call $q$VCVARS$q x64 >nul && $q$NVCC$q $NVCC_FLAGS $Extra -o $q$Out$q $q$Src$q"
+    Write-Host "[build] $Src -> $Out" -ForegroundColor Yellow
+    cmd /c $cmd
+    if ($LASTEXITCODE -ne 0) { throw "build failed: $Src" }
+}
 
 Write-Host "==== build phase ====" -ForegroundColor Cyan
-foreach ($b in $builds) {
-    $extra = if ($b.extra) { $b.extra } else { "" }
-    $cmd = "call `"$VCVARS`" x64 >nul && `"$NVCC`" $NVCC_FLAGS $extra -o `"$($b.out)`" `"$($b.src)`""
-    Write-Host "[build] $($b.src) -> $($b.out)" -ForegroundColor Yellow
-    cmd /c $cmd
-    if ($LASTEXITCODE -ne 0) { throw "build failed: $($b.src)" }
-}
+Invoke-NvccBuild "sgemm\01_naive.cu"        "sgemm\01_naive.exe"
+Invoke-NvccBuild "sgemm\02_coalesce.cu"     "sgemm\02_coalesce.exe"
+Invoke-NvccBuild "sgemm\03_smem.cu"         "sgemm\03_smem.exe"
+Invoke-NvccBuild "sgemm\04_1d_tile.cu"      "sgemm\04_1d_tile.exe"
+Invoke-NvccBuild "sgemm\05_2d_tile.cu"      "sgemm\05_2d_tile.exe"
+Invoke-NvccBuild "sgemm\06_wmma_fp16.cu"    "sgemm\06_wmma_fp16.exe"   "-lcublas"
+Invoke-NvccBuild "sgemm\bench.cu"           "sgemm\sgemm_bench.exe"    "-DLIB_ONLY -lcublas"
+Invoke-NvccBuild "softmax\softmax_cuda.cu"  "softmax\softmax_cuda.exe"
+Invoke-NvccBuild "reduction\reduction.cu"   "reduction\reduction.exe"
+Invoke-NvccBuild "flash_attn\fa1_fwd.cu"    "flash_attn\fa1_fwd.exe"
 
 Write-Host "`n==== run phase ====" -ForegroundColor Cyan
 
-# 跑 SGEMM 总 bench (5 版 + cuBLAS 对比, 写 sgemm_raw.json)
-Write-Host "`n[run] sgemm bench" -ForegroundColor Yellow
+Write-Host "`n[run] sgemm bench (5 FP32 versions + cuBLAS)" -ForegroundColor Yellow
 & .\sgemm\sgemm_bench.exe
 
-# 跑 softmax CUDA
+Write-Host "`n[run] sgemm v6 WMMA fp16  N = 2048, 4096, 8192" -ForegroundColor Yellow
+& .\sgemm\06_wmma_fp16.exe 2048
+& .\sgemm\06_wmma_fp16.exe 4096
+& .\sgemm\06_wmma_fp16.exe 8192
+
 Write-Host "`n[run] softmax cuda" -ForegroundColor Yellow
 & .\softmax\softmax_cuda.exe 4096 512
 
-# 跑 reduction
 Write-Host "`n[run] reduction" -ForegroundColor Yellow
 & .\reduction\reduction.exe
+
+Write-Host "`n[run] flash_attn fa1_fwd" -ForegroundColor Yellow
+& .\flash_attn\fa1_fwd.exe 2048 8 1
+& .\flash_attn\fa1_fwd.exe 4096 8 1
+& .\flash_attn\fa1_fwd.exe 8192 4 1
 
 Write-Host "`n==== done ====" -ForegroundColor Green

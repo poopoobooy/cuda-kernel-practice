@@ -176,6 +176,15 @@
       "max_err": 0.0
     }
   ],
+  "sgemm_wmma_fp16": {
+    "note": "FP16 in, FP32 accumulate. Compared against cuBLAS GemmEx (CUBLAS_GEMM_DEFAULT_TENSOR_OP).",
+    "kernel": "06_wmma_fp16.cu — BM=BN=128, BK=32, WM=WN=64, 4 warps/block, wmma::fragment",
+    "by_size": [
+      {"size": 2048, "ours_tflops": 43.37, "cublas_tflops": 55.48, "pct_cublas": 78.2, "max_err": 0.0},
+      {"size": 4096, "ours_tflops": 51.50, "cublas_tflops": 66.12, "pct_cublas": 77.9, "max_err": 0.0},
+      {"size": 8192, "ours_tflops": 60.48, "cublas_tflops": 77.25, "pct_cublas": 78.3, "max_err": 1.198e-3}
+    ]
+  },
   "softmax_cuda": {
     "M": 4096,
     "N": 512,
@@ -211,5 +220,17 @@
     "torch_ms": 6.47,
     "torch_gflops": 21250.6,
     "pct_torch_matmul": 64.91722586656377
+  },
+  "flash_attention_1_fwd": {
+    "note": "FP32, head_dim=64, validated bit-close to naive 3-pass attention",
+    "kernel": "flash_attn/fa1_fwd.cu — Br=Bc=64, online softmax, 32KB SMEM/block",
+    "runs": [
+      {"B": 1, "H": 1, "N":   64, "fa1_ms": 0.057, "naive_ms":   0.063, "speedup":  1.12, "max_err": 1.192e-7},
+      {"B": 1, "H": 1, "N":  512, "fa1_ms": 0.385, "naive_ms":   0.233, "speedup":  0.60, "max_err": 1.192e-7},
+      {"B": 1, "H": 1, "N": 4096, "fa1_ms": 2.121, "naive_ms":   7.648, "speedup":  3.61, "max_err": 2.068e-7},
+      {"B": 1, "H": 8, "N": 2048, "fa1_ms": 2.415, "naive_ms":  15.226, "speedup":  6.30, "max_err": 2.217e-7},
+      {"B": 1, "H": 8, "N": 4096, "fa1_ms": 7.195, "naive_ms":  60.514, "speedup":  8.41, "max_err": 2.068e-7},
+      {"B": 1, "H": 4, "N": 8192, "fa1_ms": 12.388, "naive_ms": 125.585, "speedup": 10.14, "max_err": 3.129e-7}
+    ]
   }
 }
